@@ -56,6 +56,15 @@ class PeeweeDatastore(Datastore):
         model.delete_instance()
 
 
+class DynamoDatastore(Datastore):
+    def put(self, model):
+        model.save()
+        return model
+
+    def delete(self, model):
+        model.delete()
+
+
 class UserDatastore(object):
     """Abstracted user datastore.
 
@@ -331,3 +340,134 @@ class PeeweeUserDatastore(PeeweeDatastore, UserDatastore):
             return True
         else:
             return False
+
+
+import uuid
+import logging
+import re
+class DynamoUserDatastore(DynamoDatastore, UserDatastore):
+    """ A DynamoDB datastore implementation for use by Flask-Security that
+    assumes the use of the AWS Python (boto) SDK.
+    """
+    @staticmethod
+    def _is_uuid(maybe_uuid):
+        try:
+            uuid.UUID(maybe_uuid)
+            return True
+        except ValueError as ve:
+            logging.debug(
+                '_is_uuid given invalid val:{0} message:{1}'.format(maybe_uuid,
+                                                                    ve))
+        except TypeError as te:
+            logging.debug(
+                '_is_uuid given invalid type:{0} message:{1}'.format(maybe_uuid,
+                                                                     te))
+        return False
+
+    @staticmethod
+    def _is_email(maybe_email):
+        # thanks to this answer on StackOverflow
+        # http://stackoverflow.com/questions/8022530
+        exp = r"^[A-Za-z0-9\.\+_-]+@[A-Za-z0-9\._-]+\.[a-zA-Z]*$"
+        return re.match(exp, maybe_email)
+
+    def __init__(self, db, user_model, role_model):
+        """
+
+        :param db: A connection to Dynamo DB
+        :param user_model: A user model class definition
+        :param role_model: A role model class definition
+        :return:
+        """
+        DynamoDatastore.__init__(self, db)
+        UserDatastore.__init__(self, user_model, role_model)
+        # self.db = dynamo_datastore
+        self.user_model = user_model
+        self.role_model = role_model
+
+    def get_user(self, id_or_email_or_username):
+        """Returns a user matching the specified ID, email address or username
+        """
+        returned = None
+        if DynamoUserDatastore._is_uuid(id_or_email_or_username):
+            returned = self.get_user_by_id(id_or_email_or_username)
+        elif DynamoUserDatastore._is_email(id_or_email_or_username):
+            returned = self.find_user(email=id_or_email_or_username)
+        else:
+            returned = self.find_user(username=id_or_email_or_username)
+        return returned
+
+    def find_user(self, **kwargs):
+        """Finds and returns a user matching the provided parameters."""
+        um = self.user_model
+        keys = list(kwargs.keys())
+        results = []
+        if um.email_field in keys:
+            email = kwargs.get(um.email_field)
+            logging.debug('find_user with email: {0}'.format(email))
+            if um.email_index:
+                # TODO Index exists, now use it
+                # results = model(self.db).user_table.query_2(
+                #     self.user_model.email_field + '__eq'=email,
+                #     index=model.email_index
+                # )
+                pass
+            else:
+                # Just do a scan to find the email
+                kw = {
+                    '{0}{1}'.format(um.email_field, '__eq'): email,
+                    'limit': 1
+                }
+                results = self.user_model(self.db).user_table.scan(**kw)
+
+        if self.user_model.username_field in keys:
+            username = kwargs.get(um.username_field)
+            logging.debug('find_user with username: {0}'.format(username))
+            if um.username_index is None:
+                kw = {
+                    '{0}{1}'.format(um.username_field, '__eq'): username,
+                    'limit': 1
+                }
+                results = self.user_model(self.db).user_table.scan(**kw)
+
+        # TODO add in support for arbitrary arguments as query params
+
+        for res in results:
+            # will always return first result
+            user = self.user_model(self.db)
+            user.id = res[self.user_model.user_id_field]
+            return user
+
+        return None
+
+    def create_role(self, **kwargs):
+        """Creates and returns a new role from the given parameters."""
+        raise NotImplementedError
+
+    def create_user(self, **kwargs):
+        # """Creates and returns a new user from the given parameters.
+        #
+        # :param email: the email address of the user [required]
+        # :param password: the password of the user [required]
+        # :param username: the username of the user
+        # :param first_name: the first name of the user
+        # :param last_name: the last name of the user
+        # :customer_id: the customer_id within which this user is contained
+        # """
+        keys = list(kwargs.keys())
+        if self.user_model.email_field not in keys:
+            raise ValueError('email value required')
+
+        email = kwargs.get(self.user_model.email_field)
+        if not DynamoUserDatastore._is_email(email):
+            raise ValueError('invalid email value:{0}'.format(email))
+
+        if self.user_model.password_field not in keys:
+            raise ValueError('password value required')
+
+        kwargs = self._prepare_create_user_args(**kwargs)
+        user = self.user_model(self.db, **kwargs)
+        return self.put(user)
+
+    def get_user_by_id(self, user_id):
+        return self.user_model(user_id)
