@@ -349,15 +349,29 @@ class DynamoUserDatastore(DynamoDatastore, UserDatastore):
     """ A DynamoDB datastore implementation for use by Flask-Security that
     assumes the use of the AWS Python (boto) SDK.
     """
+    def __init__(self, db, user_model, role_model):
+        """
+
+        :param db: the DynamoDatastore to use
+        :param user_model: A user model class definition
+        :param role_model: A role model class definition
+        :return:
+        """
+        DynamoDatastore.__init__(self, db)
+        UserDatastore.__init__(self, user_model, role_model)
+        self.user_model = user_model
+        self.role_model = role_model
+
     @staticmethod
     def _is_uuid(maybe_uuid):
+        logging.debug('maybe_uuid: {0}'.format(maybe_uuid))
         try:
             uuid.UUID(maybe_uuid)
             return True
         except ValueError as ve:
             logging.debug(
-                '_is_uuid given invalid val:{0} message:{1}'.format(maybe_uuid,
-                                                                    ve))
+                '_is_uuid given invalid value:{0} message:{1}'.format(maybe_uuid,
+                                                                      ve))
         except TypeError as te:
             logging.debug(
                 '_is_uuid given invalid type:{0} message:{1}'.format(maybe_uuid,
@@ -370,20 +384,6 @@ class DynamoUserDatastore(DynamoDatastore, UserDatastore):
         # http://stackoverflow.com/questions/8022530
         exp = r"^[A-Za-z0-9\.\+_-]+@[A-Za-z0-9\._-]+\.[a-zA-Z]*$"
         return re.match(exp, maybe_email)
-
-    def __init__(self, db, user_model, role_model):
-        """
-
-        :param db: A connection to Dynamo DB
-        :param user_model: A user model class definition
-        :param role_model: A role model class definition
-        :return:
-        """
-        DynamoDatastore.__init__(self, db)
-        UserDatastore.__init__(self, user_model, role_model)
-        # self.db = dynamo_datastore
-        self.user_model = user_model
-        self.role_model = role_model
 
     def get_user(self, id_or_email_or_username):
         """Returns a user matching the specified ID, email address or username
@@ -398,44 +398,66 @@ class DynamoUserDatastore(DynamoDatastore, UserDatastore):
         return returned
 
     def find_user(self, **kwargs):
-        """Finds and returns a user matching the provided parameters."""
-        um = self.user_model
+        """Finds and returns the first user matching the provided parameters.
+
+        :param id: the identifier of the user to find. This is used post-login.
+        :param email: the email address of the user to find.
+        :param username: this is used if/when there is a username on user_model
+        """
+        logging.debug('find_user {0}'.format(kwargs))
+        um = self.user_model(self.db)
         keys = list(kwargs.keys())
         results = []
-        if um.email_field in keys:
-            email = kwargs.get(um.email_field)
+        if 'id' in keys:
+            uid = kwargs.get('id')
+            return self.get_user_by_id(uid)
+
+        if 'email' in keys:
+            email = kwargs.get('email')
             logging.debug('find_user with email: {0}'.format(email))
-            if um.email_index:
-                # TODO Index exists, now use it
-                # results = model(self.db).user_table.query_2(
-                #     self.user_model.email_field + '__eq'=email,
-                #     index=model.email_index
-                # )
+            if hasattr(um, 'email_index') and um.email_index is not None:
+                # TODO Index exists, so use it
+                # kw = {
+                #     '{0}{1}'.format(um.email_attribute, '__eq'): email,
+                #     'index': um.email_index
+                #     'limit': 1
+                # }
+                # log.debug('find_user scan parameters {0}'.format(kw))
+                # results = um.user_table.query_2(**kw)
                 pass
             else:
+                logging.debug('find_user scanning for email: {0}'.format(email))
                 # Just do a scan to find the email
                 kw = {
-                    '{0}{1}'.format(um.email_field, '__eq'): email,
+                    '{0}{1}'.format(um.email_attribute, '__eq'): email,
                     'limit': 1
                 }
-                results = self.user_model(self.db).user_table.scan(**kw)
+                logging.debug('find_user scan parameters {0}'.format(kw))
+                results = um.table.scan(**kw)
 
-        if self.user_model.username_field in keys:
-            username = kwargs.get(um.username_field)
+        if 'username' in keys:
+            username = kwargs.get('username')
             logging.debug('find_user with username: {0}'.format(username))
-            if um.username_index is None:
+            if hasattr(um, 'username_index') and um.username_index is not None:
+                # TODO Index exists, so use it
+                pass
+            else:
+                logging.debug('find_user scanning for username: {0}'.format(
+                    username))
                 kw = {
                     '{0}{1}'.format(um.username_field, '__eq'): username,
                     'limit': 1
                 }
-                results = self.user_model(self.db).user_table.scan(**kw)
+                logging.debug('find_user scan parameters {0}'.format(kw))
+                results = self.user_model(self.db).table.scan(**kw)
 
         # TODO add in support for arbitrary arguments as query params
 
         for res in results:
             # will always return first result
-            user = self.user_model(self.db)
-            user.id = res[self.user_model.user_id_field]
+            user = self.user_model(self.db, item=res)
+            logging.debug('find_user result keys: {0}'.format(res.keys()))
+            logging.debug('find_user returning user.id:{0}'.format(user.id))
             return user
 
         return None
@@ -445,29 +467,146 @@ class DynamoUserDatastore(DynamoDatastore, UserDatastore):
         raise NotImplementedError
 
     def create_user(self, **kwargs):
-        # """Creates and returns a new user from the given parameters.
-        #
-        # :param email: the email address of the user [required]
-        # :param password: the password of the user [required]
-        # :param username: the username of the user
-        # :param first_name: the first name of the user
-        # :param last_name: the last name of the user
-        # :customer_id: the customer_id within which this user is contained
-        # """
-        keys = list(kwargs.keys())
-        if self.user_model.email_field not in keys:
-            raise ValueError('email value required')
+        """Creates and returns a new user from the given parameters.
 
-        email = kwargs.get(self.user_model.email_field)
+        :param email: the email address of the user [required]
+        :param password: the password of the user [required]
+        """
+        keys = list(kwargs.keys())
+        if 'email' not in keys:
+            raise ValueError('email value is required')
+
+        email = kwargs.get('email')
         if not DynamoUserDatastore._is_email(email):
             raise ValueError('invalid email value:{0}'.format(email))
 
-        if self.user_model.password_field not in keys:
-            raise ValueError('password value required')
+        if 'password' not in keys:
+            raise ValueError('password is a required field')
 
         kwargs = self._prepare_create_user_args(**kwargs)
         user = self.user_model(self.db, **kwargs)
         return self.put(user)
 
     def get_user_by_id(self, user_id):
-        return self.user_model(user_id)
+        """Get a User by user ID.
+
+        :param user_id: the user ID of the User to obtain
+        :return: a user_model User
+        """
+        um = self.user_model(self.db)
+        user = um.table.get_item(**{
+            '{0}'.format(um.user_id_attribute): user_id,
+        })
+        logging.debug('get_user_by_id id: {0}'.format(user_id))
+        return self.user_model(self.db, item=user)
+
+
+from .core import RoleMixin
+class DynamoRole(RoleMixin):
+    def __init__(self, name, description=''):
+        # self.id = role_id
+        self.name = name
+        self.description = description
+
+    def __str__(self):
+        return "<Role name: '{0}'>".format(self.name)
+
+
+from .core import UserMixin
+from boto.dynamodb2.table import Table, Item
+class DynamoUser(UserMixin):
+    """
+    Dynamo User abstract class.
+
+    Subclasses must have the following required class variables configured.
+    :var user_id_attribute: the name of the user_id attribute [required]
+    :var email_attribute: the name of the email attribute [required]
+    :var active_attribute: the name of the active attribute [required]
+    :var password_attribute: the name of the password attribute [required]
+    :var roles_attribute: the name of the roles attribute [required]
+    :var table_name: the name of the DynamoDB table to use for Users [required]
+    :var username_attribute: the name of the username attribute [optional]
+    :var email_index: name of the email index to use or 'None' [optional]
+    :var username_index: name of the username index to use or 'None' [optional]
+
+    """
+    def __init__(self, ddb, **kwargs):
+        """
+
+        :param ddb:
+        :param kwargs:
+        """
+        logging.debug('connecting to table:{0}'.format(self.table_name))
+        gi = []
+        keys = kwargs.keys()
+        if 'item' not in keys:
+            if self.email_index:
+                gi.append(self.email_index)
+            if self.username_index:
+                gi.append(self.username_index)
+
+            self.table = Table(
+                table_name=self.table_name,
+                global_indexes=gi,
+                connection=ddb
+            )
+            # data = {}
+            if 'id' in keys:
+                data = {self.user_id_attribute: '{0}'.format(kwargs.get('id'))}
+            else:
+                data = {self.user_id_attribute: '{0}'.format(uuid.uuid4())}
+
+            for key, value in kwargs.items():
+                data[key] = value
+            self._item = Item(self.table, data=data)
+        else:
+            self._item = kwargs.get('item')
+
+    def __getattr__(self, item):
+        return self._item[item]
+
+    @property
+    def id(self):
+        return self._item[self.user_id_attribute]
+
+    @id.setter
+    def id(self, value):
+        self._item[self.user_id_attribute] = value
+
+    @property
+    def email(self):
+        return self._item[self.email_attribute]
+
+    @email.setter
+    def email(self, value):
+        self._item[self.email_attribute] = value
+
+    @property
+    def active(self):
+        return self._item[self.active_attribute]
+
+    @active.setter
+    def active(self, value):
+        self._item[self.active_attribute] = value
+
+    @property
+    def roles(self):
+        roles = set()
+        rs = self._item[self.roles_attribute]
+        logging.debug('user_id: {0}, roles: {1}'.format(self.id, rs))
+        if rs:
+            for role in rs:
+                r = DynamoRole(role)
+                roles.add(r)
+                logging.debug('added DynamoRole: {0} to set'.format(r))
+        return roles
+
+    @roles.setter
+    def roles(self, values):
+        self._item['roles'] = set(values)
+
+    def save(self):
+        self._item.save()
+
+    def delete(self):
+        self._item.delete()
